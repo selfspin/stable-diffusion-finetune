@@ -17,6 +17,7 @@ from torchvision import transforms
 from tqdm import tqdm
 from torch.autograd import Variable
 import pickle
+from torch.optim import lr_scheduler
 
 from dataset.sd import *
 
@@ -47,7 +48,7 @@ def config_parser():
     ### training options
     parser.add_argument('--device', type=str, default='cuda', help="training device")
     parser.add_argument('--iters', type=int, default=10000, help="training iters")
-    parser.add_argument('--epochs', type=int, default=100, help="training epoch")
+    parser.add_argument('--epochs', type=int, default=10, help="training epoch")
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
     parser.add_argument('--lr_fine', type=float, default=5e-4, help="initial learning rate in fine stage")
     parser.add_argument('--ckpt', type=str, default='latest')
@@ -72,7 +73,7 @@ def config_parser():
 
     # gpus
     parser.add_argument('--local_rank', type=int, default=0, help="node rank for distributed training")
-    parser.add_argument('--gpus', type=str, default="4", help="devices: '0,1,2,3' ")
+    parser.add_argument('--gpus', type=str, default="5", help="devices: '0,1,2,3' ")
     parser.add_argument('--bs', type=str, default=1, help="per gpu batch size")
     parser.add_argument('--port', type=int, default=3245, help="port, arbitrary number in 0~65536")
 
@@ -159,8 +160,9 @@ if __name__ == '__main__':
 
     opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max, weight_decay=0.001)
     scaler = torch.cuda.amp.GradScaler()
-    lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
-                                      [0, args.lr_max, args.lr_max / 20.0, 0])[0]
+    # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
+    #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
+    scheduler = lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     criterion = DiffusionLoss()
 
@@ -173,9 +175,9 @@ if __name__ == '__main__':
             model.train()
             image = image.cuda()
 
-            lr = lr_schedule(epoch + (i + 1) / len(trainloader))
-            opt.param_groups[0].update(lr=lr)
-            # lr = opt.state_dict()['param_groups'][0]['lr']
+            # lr = lr_schedule(epoch + (i + 1) / len(trainloader))
+            # opt.param_groups[0].update(lr=lr)
+            lr = opt.state_dict()['param_groups'][0]['lr']
 
             opt.zero_grad()
             with torch.cuda.amp.autocast():
@@ -188,6 +190,7 @@ if __name__ == '__main__':
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
             scaler.step(opt)
+            scheduler.step()
             scaler.update()
 
             train_loss += loss.item() * image.size(0)
