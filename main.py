@@ -190,12 +190,12 @@ if __name__ == '__main__':
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
             scaler.step(opt)
-            scheduler.step()
             scaler.update()
 
             train_loss += loss.item() * image.size(0)
             n += image.size(0)
 
+        scheduler.step()
         loss_list.append(train_loss / n)
         lr_list.append(lr)
 
