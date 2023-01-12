@@ -82,13 +82,13 @@ class StableDiffusion(nn.Module):
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         return text_embeddings
 
-    def train_step(self, image, label, guidance_scale=100):
+    def forward(self, image, label, guidance_scale=100):
         B = image.size(0)
         text_embeds = self.get_text_embeds(label, '')
         # interp to 512x512 to be fed into vae.
 
         # timestep ~ U(0.001, 1)
-        t = torch.randint(self.min_step, self.max_step + 1, [B], dtype=torch.long, device=self.device)
+        t = torch.randint(self.min_step, self.max_step, [B], dtype=torch.long, device=self.device)
         # encode image into latents with vae, requires grad!
         latents = self.encode_imgs(image)
 
@@ -216,13 +216,17 @@ if __name__ == '__main__':
     device = torch.device('cuda')
 
     sd = StableDiffusion(device, opt)
-    for index in range(10):
-        seed_everything(opt.seed + index)
+    file = 'stable-diffusion-finetune/checkpoints'
+    for lr in ['5e-08']:
+        for epoch in os.listdir(os.path.join(file, lr)):
+            sd.load_state_dict(torch.load(os.path.join(file, lr, epoch)))
+            for index in range(20):
+                seed_everything(opt.seed + index)
 
-        imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
+                imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
 
-        # visualize image
-        os.makedirs(os.path.join('2d', str(opt.prompt)), exist_ok=True)
-        plt.imsave(os.path.join('2d', str(opt.prompt), str(index) + '.png'), imgs[0])
-        # plt.imshow(imgs[0])
-        # plt.show()
+                # visualize image
+                os.makedirs(os.path.join('2d', str(opt.prompt), lr, epoch[:6]), exist_ok=True)
+                plt.imsave(os.path.join('2d', str(opt.prompt), lr, epoch[:6], str(index) + '.png'), imgs[0])
+                # plt.imshow(imgs[0])
+                # plt.show()

@@ -1,6 +1,7 @@
 from torch.utils.data import dataloader
 from dataset.dataset import *
 import matplotlib.pyplot as plt
+from warmup_scheduler.scheduler import GradualWarmupScheduler
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,10 @@ import pickle
 from torch.optim import lr_scheduler
 
 from dataset.sd import *
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from distributed_utils import reduce_value, is_main_process
 
 '''
 for image, label in train_loader:
@@ -48,7 +53,7 @@ def config_parser():
     ### training options
     parser.add_argument('--device', type=str, default='cuda', help="training device")
     parser.add_argument('--iters', type=int, default=10000, help="training iters")
-    parser.add_argument('--epochs', type=int, default=10, help="training epoch")
+    parser.add_argument('--epochs', type=int, default=100, help="training epoch")
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
     parser.add_argument('--lr_fine', type=float, default=5e-4, help="initial learning rate in fine stage")
     parser.add_argument('--ckpt', type=str, default='latest')
@@ -128,77 +133,122 @@ def config_parser():
     # others
     parser.add_argument('--clip-norm', default=True, action='store_true')
     parser.add_argument('--lr-max', default=0.0001, type=float)
-    parser.add_argument('--towards', default='side', type=str)
+    parser.add_argument('--towards', default='side2', type=str)
 
     opt = parser.parse_args()
     return opt
 
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+    
+def main_worker(local_rank, nprocs, args):
+    args.local_rank = local_rank
+    torch.cuda.set_device(args.local_rank)
 
+    dist.init_process_group(backend="nccl",
+                            init_method=f'tcp://127.0.0.1:{args.port}',
+                            world_size=nprocs,
+                            rank=local_rank)
+    args.world_size = dist.get_world_size()
+    args.global_rank = dist.get_rank()
+    args.bs = int(args.bs)
+    seed_everything(args.seed + args.global_rank)
+
+    if args.global_rank == 0:
+        print(args)
+
+    device = torch.device('cuda', args.local_rank)
+
+
+
+
+    print("Loading training data ...")
+    train_dataset = PandaDataset(toward=args.towards, train=True)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset=train_dataset)
+    trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
+
+    for max_lr in [5e-8]:
+        
+        os.makedirs(os.path.join("checkpoints/", str(max_lr)), exist_ok=True)
+        args.lr_max = max_lr
+        
+        model = StableDiffusion(args.device, args)
+        if args.world_size > 1:
+            process_group = torch.distributed.new_group(list(range(dist.get_world_size())))
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],  output_device=local_rank, find_unused_parameters=True)
+        for name, parameter in model.named_parameters():
+            if 'unet' not in name:
+                parameter.requires_grad = False
+
+        opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max/10, weight_decay=0.001)
+        scaler = torch.cuda.amp.GradScaler()
+        # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
+        #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
+        Cosinescheduler = lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+        scheduler = GradualWarmupScheduler(opt, multiplier=10, total_epoch=args.epochs/10, after_scheduler=Cosinescheduler) 
+        criterion = DiffusionLoss()
+        loss_list = []
+        lr_list = []
+        
+        for epoch in range(args.epochs):
+            if args.world_size > 1:
+                sampler.set_epoch(epoch)
+            start = time.time()
+            train_loss, train_acc, n, loss_value, lr = 0, 0, 0, 0, 0
+            if is_main_process():
+                trainloader = tqdm(trainloader, ncols=0)
+            # for i, (image, label) in enumerate(tqdm(trainloader, ncols=0)):
+            for i, (image, label) in enumerate(trainloader):
+                model.train()
+                image = image.cuda()
+
+                # lr = lr_schedule(epoch + (i + 1) / len(trainloader))
+                # opt.param_groups[0].update(lr=lr)
+                lr = opt.state_dict()['param_groups'][0]['lr']
+
+                opt.zero_grad()
+                with torch.cuda.amp.autocast():
+                    w, noise_pred, noise = model(image, label)
+                    loss = criterion(w, noise_pred, noise)
+
+                scaler.scale(loss).backward()
+                if args.clip_norm:
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                scaler.step(opt)
+                scaler.update()
+
+                train_loss += reduce_value(loss, average=True).item() * image.size(0)
+                n += image.size(0)
+
+            scheduler.step()
+            loss_list.append(train_loss / n)
+            lr_list.append(lr)
+
+            if is_main_process():
+                print(
+                    f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
+                    f'Time: {time.time() - start:.1f}, lr: {lr:.10f}')
+                if epoch % 20 == 0:
+                    torch.save(model.module.state_dict(), os.path.join("checkpoints", str(max_lr), str(epoch)+"finetuned_stable_diffusion.pth"))
 if __name__ == '__main__':
     args = config_parser()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-    seed_value = args.seed
-    np.random.seed(seed_value)
-    torch.manual_seed(seed_value)
-    random.seed(seed_value)
-    if args.device != 'cpu':
-        torch.cuda.manual_seed(seed_value)
-        torch.cuda.manual_seed_all(seed_value)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    print("Loading training data ...")
-    train_dataset = PicDataset(toward='side', train=True)
-    trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=True)
-
-    model = StableDiffusion(args.device, args)
-
-    for name, parameter in model.named_parameters():
-        if 'unet' not in name:
-            parameter.requires_grad = False
-
-    opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max, weight_decay=0.001)
-    scaler = torch.cuda.amp.GradScaler()
-    # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
-    #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
-    scheduler = lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-
-    criterion = DiffusionLoss()
-
-    loss_list = []
-    lr_list = []
-    for epoch in range(args.epochs):
-        start = time.time()
-        train_loss, train_acc, n, loss_value, lr = 0, 0, 0, 0, 0
-        for i, (image, label) in enumerate(tqdm(trainloader, ncols=0)):
-            model.train()
-            image = image.cuda()
-
-            # lr = lr_schedule(epoch + (i + 1) / len(trainloader))
-            # opt.param_groups[0].update(lr=lr)
-            lr = opt.state_dict()['param_groups'][0]['lr']
-
-            opt.zero_grad()
-            with torch.cuda.amp.autocast():
-                w, noise_pred, noise = model.train_step(image, label)
-                loss = criterion(w, noise_pred, noise)
-
-            scaler.scale(loss).backward()
-            if args.clip_norm:
-                scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            scaler.step(opt)
-            scaler.update()
-
-            train_loss += loss.item() * image.size(0)
-            n += image.size(0)
-
-        scheduler.step()
-        loss_list.append(train_loss / n)
-        lr_list.append(lr)
-
-        print(
-            f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
-            f'Time: {time.time() - start:.1f}, lr: {lr:.6f}')
+    args.nprocs = len(args.gpus.split(','))
+    # seed_value = args.seed
+    # np.random.seed(seed_value)
+    # torch.manual_seed(seed_value)
+    # random.seed(seed_value)
+    # if args.device != 'cpu':
+    #     torch.cuda.manual_seed(seed_value)
+    #     torch.cuda.manual_seed_all(seed_value)
+    #     torch.backends.cudnn.deterministic = True
+    #     torch.backends.cudnn.benchmark = False
+    mp.spawn(main_worker, nprocs=args.nprocs, args=(args.nprocs, args))
+    

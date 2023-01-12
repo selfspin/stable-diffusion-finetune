@@ -19,7 +19,6 @@ class DiffusionLoss(nn.Module):
     def forward(self, w, noise_pred, noise):
         return torch.mean(w * torch.pow(noise_pred - noise, 2))
 
-
 class PicDataset(dataset.Dataset):
     def __init__(self, picture_size=512, toward='side', train=True):
         super().__init__()
@@ -56,6 +55,51 @@ class PicDataset(dataset.Dataset):
     def __getitem__(self, index):
         label = self.label_list[index]
         img_path = 'dataset/images/' + self.toward + '/{id}.png'.format(id=self.ID_list[index])
+        img = Image.open(img_path)
+
+        # 注意区分预处理
+        if self.train:
+            img = self.train_transforms(img)
+        else:
+            img = self.test_transforms(img)
+
+        return img, label
+
+    def __len__(self):
+        return len(self.ID_list)
+
+class PandaDataset(dataset.Dataset):
+    def __init__(self, picture_size=512, toward='side', train=True):
+        super().__init__()
+        self.train = train
+        self.toward = toward
+        self.ID_list = []
+        self.label_list = []
+
+        # train预处理
+        self.train_transforms = transforms.Compose([
+            transforms.Resize([picture_size, picture_size]),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor()
+        ])
+
+        # test预处理
+        self.test_transforms = transforms.Compose([
+            transforms.Resize([picture_size, picture_size]),
+            transforms.ToTensor()
+        ])
+
+        self.get_img()
+
+    # 读取图片
+    def get_img(self):
+        img_path = '../laion/dataset/laion/images/panda/' + self.toward 
+        for file_name in os.listdir(img_path):
+            self.ID_list.append(file_name)
+
+    def __getitem__(self, index):
+        label = 'a panda, ' + self.toward + ' view' # self.label_list[index]
+        img_path = '../laion/dataset/laion/images/panda/' + self.toward + '/{id}'.format(id=self.ID_list[index])
         img = Image.open(img_path)
 
         # 注意区分预处理
