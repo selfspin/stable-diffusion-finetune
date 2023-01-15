@@ -1,5 +1,5 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
@@ -21,7 +21,7 @@ def seed_everything(seed):
     # torch.backends.cudnn.benchmark = True
 
 
-class StableDiffusion(nn.Module):
+class StableDiffusionv2base(nn.Module):
     def __init__(self, device, opt):
         super().__init__()
 
@@ -41,29 +41,32 @@ class StableDiffusion(nn.Module):
         self.max_step = int(self.num_train_timesteps * 1)
 
         print(f'[INFO] loading stable diffusion...')
+        model_key = "stabilityai/stable-diffusion-2-base"
 
         # 1. Load the autoencoder model which will be used to decode the latents into image space. 
-        self.vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="vae",
+        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae",
                                                  use_auth_token=self.token).to(self.device)
 
         # 2. Load the tokenizer and text encoder to tokenize and encode the text. 
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
-        # 效果相同
-        # self.tokenizer = CLIPTokenizer.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="tokenizer",
-        #                                                use_auth_token=self.token)
-        # self.text_encoder = CLIPTextModel.from_pretrained("runwayml/stable-diffusion-v1-5",
-        #                                                   subfolder="text_encoder",
-        #                                                   use_auth_token=self.token).to(self.device)
-
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer",
+                                                       use_auth_token=self.token)
+        self.text_encoder = CLIPTextModel.from_pretrained(model_key,
+                                                          subfolder="text_encoder",
+                                                          use_auth_token=self.token).to(self.device)
 
         # 3. The UNet model for generating the latents.
-        self.unet = UNet2DConditionModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="unet",
+        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet",
                                                          use_auth_token=self.token).to(self.device)
 
         # 4. Create a scheduler for inference
-        self.scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
-                                       num_train_timesteps=self.num_train_timesteps)
+        self.scheduler = DDIMScheduler.from_config(model_key, subfolder="scheduler")
+        # self.scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
+        #                         num_train_timesteps=self.num_train_timesteps,
+        #                         clip_sample=False, set_alpha_to_one=False, steps_offset=1,
+        #                         trained_betas=None)
+
+        # self.scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
+        #                                num_train_timesteps=self.num_train_timesteps)
         self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
 
         print(f'[INFO] loaded stable diffusion!')
@@ -221,19 +224,23 @@ if __name__ == '__main__':
     opt = parser.parse_args()
 
     device = torch.device('cuda')
-
-    sd = StableDiffusion(device, opt)
+    view_list = ['side', 'front', 'back', 'overhead']
+    sd = StableDiffusionv2base(device, opt)
     file = 'stable-diffusion-finetune/checkpoints'
-    for lr in ['5e-08', '8e-08', '1e-07']:
-        for epoch in os.listdir(os.path.join(file, lr)):
-            sd.load_state_dict(torch.load(os.path.join(file, lr, epoch)))
-            for index in range(20):
-                seed_everything(opt.seed + index)
+    for view in view_list:
+        text = opt.prompt+', '+view+' view'
+        print(text)
+        for lr in ['2e-08','3e-08','1e-08','5e-08','8e-08']:# ['1e-08','5e-08', '8e-08', '1e-07', '5e-07']:
+            # for epoch in ['gt_image']:
+            for epoch in os.listdir(os.path.join(file, lr)):
+                sd.load_state_dict(torch.load(os.path.join(file, lr, epoch)))
+                for index in range(20):
+                    seed_everything(opt.seed + index)
 
-                imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
+                    imgs = sd.prompt_to_img(text, opt.negative, opt.H, opt.W, opt.steps)
 
-                # visualize image
-                os.makedirs(os.path.join('2d', str(opt.prompt), lr, epoch[:6]), exist_ok=True)
-                plt.imsave(os.path.join('2d', str(opt.prompt), lr, epoch[:6], str(index) + '.png'), imgs[0])
-                # plt.imshow(imgs[0])
-                # plt.show()
+                    # visualize image
+                    os.makedirs(os.path.join('2dbase', str(text), lr, epoch[:6]), exist_ok=True)
+                    plt.imsave(os.path.join('2dbase', str(text), lr, epoch[:6], str(index) + '.png'), imgs[0])
+                    # plt.imshow(imgs[0])
+                    # plt.show()

@@ -11,7 +11,7 @@ from PIL import Image
 import os.path
 from torch import nn
 
-
+from torchvision.utils import save_image
 class DiffusionLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -73,19 +73,25 @@ class PandaDataset(dataset.Dataset):
         super().__init__()
         self.train = train
         self.toward = toward
+        self.image_path = '../laion/dataset/laion/images/panda_fine2'
         self.ID_list = []
         self.label_list = []
 
         # train预处理
         self.train_transforms = transforms.Compose([
-            transforms.Resize([picture_size, picture_size]),
+            transforms.Resize([picture_size]),
+            transforms.RandomCrop([picture_size, picture_size]),
+            # transforms.CenterCrop([picture_size, picture_size]),
+            # transforms.Resize([picture_size, picture_size]),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor()
         ])
 
         # test预处理
         self.test_transforms = transforms.Compose([
-            transforms.Resize([picture_size, picture_size]),
+            transforms.Resize([picture_size]),
+            transforms.CenterCrop([picture_size, picture_size]),
+            # transforms.Resize([picture_size, picture_size]),
             transforms.ToTensor()
         ])
 
@@ -93,13 +99,15 @@ class PandaDataset(dataset.Dataset):
 
     # 读取图片
     def get_img(self):
-        img_path = '../laion/dataset/laion/images/panda/' + self.toward 
-        for file_name in os.listdir(img_path):
-            self.ID_list.append(file_name)
+        for toward in ['side', 'front', 'back', 'overhead']:
+            img_path = os.path.join(self.image_path, toward)
+            for file_name in os.listdir(img_path):
+                self.ID_list.append(os.path.join(toward, file_name))
+                self.label_list.append(toward)
 
     def __getitem__(self, index):
-        label = 'a panda, ' + self.toward + ' view' # self.label_list[index]
-        img_path = '../laion/dataset/laion/images/panda/' + self.toward + '/{id}'.format(id=self.ID_list[index])
+        label = 'a panda, ' + self.label_list[index] + ' view'
+        img_path = os.path.join(self.image_path, self.ID_list[index]) # '../laion/dataset/laion/images/panda/' + self.toward + '/{id}'.format(id=self.ID_list[index])
         img = Image.open(img_path)
 
         # 注意区分预处理
@@ -107,7 +115,8 @@ class PandaDataset(dataset.Dataset):
             img = self.train_transforms(img)
         else:
             img = self.test_transforms(img)
-
+        # save_image(img, os.path.join("./cropped",img_path.split('/')[-2], img_path.split('/')[-1]))
+        # print(img.shape, img_path)
         return img, label
 
     def __len__(self):

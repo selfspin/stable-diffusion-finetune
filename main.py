@@ -21,6 +21,7 @@ import pickle
 from torch.optim import lr_scheduler
 
 from dataset.sd import *
+from dataset.sd2base import *
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -170,16 +171,16 @@ def main_worker(local_rank, nprocs, args):
     sampler = torch.utils.data.distributed.DistributedSampler(dataset=train_dataset)
     trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
 
-    for max_lr in [5e-8]:
-        
+    for max_lr in [1e-8, 2e-8, 3e-8]:
         os.makedirs(os.path.join("checkpoints/", str(max_lr)), exist_ok=True)
         args.lr_max = max_lr
         
-        model = StableDiffusion(args.device, args)
+        model = StableDiffusionv2base(args.device, args)
         if args.world_size > 1:
             process_group = torch.distributed.new_group(list(range(dist.get_world_size())))
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],  output_device=local_rank, find_unused_parameters=True)
+
         for name, parameter in model.named_parameters():
             if 'unet' not in name:
                 parameter.requires_grad = False
@@ -199,8 +200,8 @@ def main_worker(local_rank, nprocs, args):
                 sampler.set_epoch(epoch)
             start = time.time()
             train_loss, train_acc, n, loss_value, lr = 0, 0, 0, 0, 0
-            if is_main_process():
-                trainloader = tqdm(trainloader, ncols=0)
+            # if is_main_process():
+            #     trainloader = tqdm(trainloader, ncols=0)
             # for i, (image, label) in enumerate(tqdm(trainloader, ncols=0)):
             for i, (image, label) in enumerate(trainloader):
                 model.train()
@@ -234,11 +235,15 @@ def main_worker(local_rank, nprocs, args):
                 print(
                     f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
                     f'Time: {time.time() - start:.1f}, lr: {lr:.10f}')
-                if epoch % 20 == 0:
-                    torch.save(model.module.state_dict(), os.path.join("checkpoints", str(max_lr), str(epoch)+"finetuned_stable_diffusion.pth"))
+                if (epoch+1) % 20 == 0:
+                    torch.save(model.module.state_dict(), os.path.join("checkpoints", str(max_lr), str(epoch+1)+"finetuned_stable_diffusion.pth"))
 if __name__ == '__main__':
     args = config_parser()
-
+    # model = StableDiffusionv2base(args.device, args)
+    # for name, parameter in model.named_parameters():
+    #     print(name)
+    # import pdb
+    # pdb.set_trace()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     args.nprocs = len(args.gpus.split(','))
     # seed_value = args.seed
