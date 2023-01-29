@@ -224,13 +224,19 @@ if __name__ == '__main__':
     opt = parser.parse_args()
 
     device = torch.device('cuda')
-    view_list = ['side', 'front', 'back', 'overhead']
+    view_list = [ 'left', 'right', 'front left', 'front right', 'back left', 'back right', 'front', 'back']#['side', 'front', 'back', 'overhead']['side rear']#
     sd = StableDiffusionv2base(device, opt)
     file = 'stable-diffusion-finetune/checkpoints'
     for view in view_list:
-        text = opt.prompt+', '+view+' view'
+        # text = opt.prompt+', '+view+' view'
+        # text = 'the '+view+' side of '+opt.prompt
+        # text = 'the '+view+'-hand side of '+opt.prompt
+        # text = 'the '+view+' view of '+opt.prompt+', '+view+' view'
+        # text = 'the '+view+' view of '+opt.prompt+' from the '+view+' view'
+        text = 'the '+view+' hand side of '+opt.prompt+' from the '+view+' view'
+
         print(text)
-        for lr in ['2e-08','3e-08','1e-08','5e-08','8e-08']:# ['1e-08','5e-08', '8e-08', '1e-07', '5e-07']:
+        for lr in ['1e-08','2e-08','1.5000000000000002e-08']:# ['1e-08','5e-08', '8e-08', '1e-07', '5e-07']:
             # for epoch in ['gt_image']:
             for epoch in os.listdir(os.path.join(file, lr)):
                 sd.load_state_dict(torch.load(os.path.join(file, lr, epoch)))
@@ -240,7 +246,7 @@ if __name__ == '__main__':
                     imgs = sd.prompt_to_img(text, opt.negative, opt.H, opt.W, opt.steps)
 
                     # visualize image
-                    os.makedirs(os.path.join('2dbase', str(text), lr, epoch[:6]), exist_ok=True)
-                    plt.imsave(os.path.join('2dbase', str(text), lr, epoch[:6], str(index) + '.png'), imgs[0])
+                    os.makedirs(os.path.join('2dbase', str('hand side  of '+opt.prompt+' from the '), str(view), lr, epoch[:6]), exist_ok=True)
+                    plt.imsave(os.path.join('2dbase', str('hand side  of '+opt.prompt+' from the '), str(view), lr, epoch[:6], str(index) + '.png'), imgs[0])
                     # plt.imshow(imgs[0])
                     # plt.show()
