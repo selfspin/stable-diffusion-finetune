@@ -20,26 +20,11 @@ from torch.autograd import Variable
 import pickle
 from torch.optim import lr_scheduler
 
-from dataset.sd import *
-from dataset.sd2base import *
+from dataset.clip_image import *
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from distributed_utils import reduce_value, is_main_process
-
-'''
-for image, label in train_loader:
-    arrayImg = image.numpy()  # transfer tensor to array
-    # arrayShow = np.squeeze(arrayImg[0], 0)  # extract the image being showed
-    plt.imshow(arrayImg[0].transpose(1, 2, 0))  # show image
-    plt.show()
-    print(label[0])
-
-    plt.imshow(arrayImg[1].transpose(1, 2, 0))  # show image
-    plt.show()
-    print(label[1])
-    break
-'''
 
 
 def config_parser():
@@ -49,7 +34,7 @@ def config_parser():
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--guidance', type=str, default='stable-diffusion',
                         help='choose from [stable-diffusion, stable-diffusion-v2, stable-diffusion-v2base, clip]')
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=1)
 
     ### training options
     parser.add_argument('--device', type=str, default='cuda', help="training device")
@@ -79,9 +64,9 @@ def config_parser():
 
     # gpus
     parser.add_argument('--local_rank', type=int, default=0, help="node rank for distributed training")
-    parser.add_argument('--gpus', type=str, default="5", help="devices: '0,1,2,3' ")
-    parser.add_argument('--bs', type=str, default=1, help="per gpu batch size")
-    parser.add_argument('--port', type=int, default=15864, help="port, arbitrary number in 0~65536")
+    parser.add_argument('--gpus', type=str, default="0,1,2,3,4,5,6,7", help="devices: '0,1,2,3' ")
+    parser.add_argument('--bs', type=str, default=16, help="per gpu batch size")
+    parser.add_argument('--port', type=int, default=15684, help="port, arbitrary number in 0~65536")
 
     # model options
     parser.add_argument('--bg_radius', type=float, default=1.4,
@@ -164,99 +149,44 @@ def main_worker(local_rank, nprocs, args):
         print(args)
 
     device = torch.device('cuda', args.local_rank)
+    model = CLIP(args.device, args)
+    model_path = './shuffler_checkpoints/0.01/100view_classifier.pth'
+    model.load_state_dict(torch.load(model_path))
+    model.cuda()
 
-    print("Loading training data ...")
-    train_dataset = HandmadeDataset(train=True)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset=train_dataset)
-    trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
+    if is_main_process():
+        print("Loading training data ...")
+    classify_dataset = PicDataset(train=False)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset=classify_dataset)
+    loader = dataloader.DataLoader(dataset=classify_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
+    if is_main_process():
+        print("Loaded!")
 
-    for max_lr in [1e-8, 2e-8, 3e-8]:
-        os.makedirs(os.path.join("checkpoints/", str(max_lr)), exist_ok=True)
-        args.lr_max = max_lr
+    for view in ['front', 'back', 'side']:
+        os.makedirs(os.path.join("./dataset/laion5B_filter", view), exist_ok=True)
 
-        model = StableDiffusionv2base(args.device, args)
-        if args.world_size > 1:
-            process_group = torch.distributed.new_group(list(range(dist.get_world_size())))
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
-                                                              find_unused_parameters=True)
+    view2label = {'back': 0, 'front': 1, 'side': 2, 'others': 3}
+    label2view = ['back', 'front', 'side', 'others']
+    view_num = [0, 0, 0, 0]
 
-        for name, parameter in model.named_parameters():
-            if 'unet' not in name:
-                parameter.requires_grad = False
-
-        opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max / 10, weight_decay=0.001)
-        scaler = torch.cuda.amp.GradScaler()
-        # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
-        #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
-        Cosinescheduler = lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-        scheduler = GradualWarmupScheduler(opt, multiplier=10, total_epoch=args.epochs / 10,
-                                           after_scheduler=Cosinescheduler)
-        criterion = DiffusionLoss()
-        loss_list = []
-        lr_list = []
-
-        for epoch in range(args.epochs):
-            if args.world_size > 1:
-                sampler.set_epoch(epoch)
-            start = time.time()
-            train_loss, train_acc, n, loss_value, lr = 0, 0, 0, 0, 0
-            if is_main_process():
-                trainloader = tqdm(trainloader)
-            for i, (image, label) in enumerate(trainloader):
-            # for i, (image, label) in enumerate(trainloader):
-                model.train()
-                image = image.cuda()
-
-                # lr = lr_schedule(epoch + (i + 1) / len(trainloader))
-                # opt.param_groups[0].update(lr=lr)
-                lr = opt.state_dict()['param_groups'][0]['lr']
-
-                opt.zero_grad()
-                with torch.cuda.amp.autocast():
-                    w, noise_pred, noise = model(image, label)
-                    loss = criterion(w, noise_pred, noise)
-
-                scaler.scale(loss).backward()
-                if args.clip_norm:
-                    scaler.unscale_(opt)
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-                scaler.step(opt)
-                scaler.update()
-
-                train_loss += reduce_value(loss, average=True).item() * image.size(0)
-                n += image.size(0)
-
-            scheduler.step()
-            loss_list.append(train_loss / n)
-            lr_list.append(lr)
-
-            if is_main_process():
-                print(
-                    f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
-                    f'Time: {time.time() - start:.1f}, lr: {lr:.10f}')
-                if (epoch + 1) % 20 == 0:
-                    torch.save(model.module.state_dict(), os.path.join("checkpoints", str(max_lr),
-                                                                       str(epoch + 1) + "finetuned_stable_diffusion.pth"))
+    for image, label in tqdm(loader):
+        model.eval()
+        image = image.cuda()
+        pred = model(image)
+        view_type = pred.argmax(dim=1)
+        threshold = 0.4
+        for i in range(image.shape[0]):
+            if view_type[i] < 2.5 and pred[i, view_type[i]] > threshold:
+                try:
+                    view = label2view[int(view_type[i])]
+                    path = os.path.join("./dataset/laion5B_filter", view, f'{pred[i, view_type[i]]:.2f}_{label[i]}.jpg')
+                    torchvision.utils.save_image(image[i], path, normalize=True)
+                except (FileNotFoundError, OSError):
+                    continue
 
 
 if __name__ == '__main__':
     args = config_parser()
-    # model = StableDiffusionv2base(args.device, args)
-    # for name, parameter in model.named_parameters():
-    #     print(name)
-    # import pdb
-    # pdb.set_trace()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     args.nprocs = len(args.gpus.split(','))
-    # seed_value = args.seed
-    # np.random.seed(seed_value)
-    # torch.manual_seed(seed_value)
-    # random.seed(seed_value)
-    # if args.device != 'cpu':
-    #     torch.cuda.manual_seed(seed_value)
-    #     torch.cuda.manual_seed_all(seed_value)
-    #     torch.backends.cudnn.deterministic = True
-    #     torch.backends.cudnn.benchmark = False
     mp.spawn(main_worker, nprocs=args.nprocs, args=(args.nprocs, args))

@@ -26,6 +26,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from distributed_utils import reduce_value, is_main_process
 
+
 def config_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', action='store_true', help="test mode")
@@ -63,9 +64,9 @@ def config_parser():
 
     # gpus
     parser.add_argument('--local_rank', type=int, default=0, help="node rank for distributed training")
-    parser.add_argument('--gpus', type=str, default="5", help="devices: '0,1,2,3' ")
-    parser.add_argument('--bs', type=str, default=1, help="per gpu batch size")
-    parser.add_argument('--port', type=int, default=3245, help="port, arbitrary number in 0~65536")
+    parser.add_argument('--gpus', type=str, default="0,1,2,3,4,5,6,7", help="devices: '0,1,2,3' ")
+    parser.add_argument('--bs', type=str, default=16, help="per gpu batch size")
+    parser.add_argument('--port', type=int, default=15684, help="port, arbitrary number in 0~65536")
 
     # model options
     parser.add_argument('--bg_radius', type=float, default=1.4,
@@ -123,12 +124,14 @@ def config_parser():
     opt = parser.parse_args()
     return opt
 
+
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
-    
+
+
 def main_worker(local_rank, nprocs, args):
     args.local_rank = local_rank
     torch.cuda.set_device(args.local_rank)
@@ -147,60 +150,64 @@ def main_worker(local_rank, nprocs, args):
 
     device = torch.device('cuda', args.local_rank)
 
-
-
-
-    print("Loading training data ...")
+    if is_main_process():
+        print("Loading training data ...")
     train_dataset = ViewDataset(train=True)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset=train_dataset)
     trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
+    if is_main_process():
+        print("Loaded!")
 
-    for max_lr in [1e-8, 2e-8, 1e-8*1.5]:
+    for max_lr in [1e-2, 1e-3, 1e-4]:
         os.makedirs(os.path.join("shuffler_checkpoints/", str(max_lr)), exist_ok=True)
         args.lr_max = max_lr
-        
+
         model = CLIP(args.device, args)
         for name, parameter in model.named_parameters():
-            if 'clip_model' in name: 
+            if 'clip_model' in name:
                 parameter.requires_grad = False
 
         if args.world_size > 1:
             process_group = torch.distributed.new_group(list(range(dist.get_world_size())))
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],  output_device=local_rank, find_unused_parameters=True)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
+                                                              find_unused_parameters=False)
 
- 
-
-        opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max/10, weight_decay=0.001)
+        opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max / 10, weight_decay=0.001)
         scaler = torch.cuda.amp.GradScaler()
         # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
         #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
         Cosinescheduler = lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-        scheduler = GradualWarmupScheduler(opt, multiplier=10, total_epoch=args.epochs/10, after_scheduler=Cosinescheduler) 
+        scheduler = GradualWarmupScheduler(opt, multiplier=10, total_epoch=args.epochs / 10,
+                                           after_scheduler=Cosinescheduler)
         criterion = DiffusionLoss()
         loss_list = []
         lr_list = []
-        
+
         for epoch in range(args.epochs):
             if args.world_size > 1:
                 sampler.set_epoch(epoch)
             start = time.time()
             train_loss, train_acc, n, loss_value, lr = 0, 0, 0, 0, 0
             if is_main_process():
-                trainloader = tqdm(trainloader, ncols=0)
-            for i, (image, label) in enumerate(tqdm(trainloader, ncols=0)):
+                trainloader = tqdm(trainloader)
+            for image, label in trainloader:
                 model.train()
                 image = image.cuda()
+                label = label.cuda()
 
                 # lr = lr_schedule(epoch + (i + 1) / len(trainloader))
                 # opt.param_groups[0].update(lr=lr)
                 lr = opt.state_dict()['param_groups'][0]['lr']
-                label_pe = torch.zeros([4], device=args.device)
-                label_pe[int(label[0])] = 1
+                # label_pe = torch.zeros([label.shape[0], 4], device=args.device)
+                # for j in range(label.shape[0]):
+                #     label_pe[j, int(label[j])] = 1
                 opt.zero_grad()
                 with torch.cuda.amp.autocast():
                     pred = model(image)
-                    loss =  F.cosine_similarity(label_pe, pred.squeeze(), dim=0)
+                    # loss = F.cosine_similarity(label_pe, pred.squeeze(), dim=1).mean()
+                    loss_f = nn.CrossEntropyLoss()
+                    loss = loss_f(pred, label)
 
                 scaler.scale(loss).backward()
                 if args.clip_norm:
@@ -211,6 +218,7 @@ def main_worker(local_rank, nprocs, args):
                 scaler.update()
 
                 train_loss += reduce_value(loss, average=True).item() * image.size(0)
+                train_acc += (label == pred.argmax(dim=1)).sum()
                 n += image.size(0)
 
             scheduler.step()
@@ -220,12 +228,15 @@ def main_worker(local_rank, nprocs, args):
             if is_main_process():
                 print(
                     f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
+                    f'Train Acc: {train_acc / n:.4f},'
                     f'Time: {time.time() - start:.1f}, lr: {lr:.10f}')
-                if (epoch+1) % 100 == 0:
-                    torch.save(model.module.state_dict(), os.path.join("shuffler_checkpoints", str(max_lr), str(epoch+1)+"finetuned_stable_diffusion.pth"))
+                if (epoch + 1) % 100 == 0:
+                    torch.save(model.module.state_dict(), os.path.join("shuffler_checkpoints", str(max_lr),
+                                                                       str(epoch + 1) + "view_classifier.pth"))
+
+
 if __name__ == '__main__':
     args = config_parser()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     args.nprocs = len(args.gpus.split(','))
     mp.spawn(main_worker, nprocs=args.nprocs, args=(args.nprocs, args))
-    
