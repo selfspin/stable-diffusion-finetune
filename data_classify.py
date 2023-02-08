@@ -26,6 +26,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from distributed_utils import reduce_value, is_main_process
 
+from PIL import ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 def config_parser():
     parser = argparse.ArgumentParser()
@@ -132,7 +136,7 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = True
 
 
-def main_worker(local_rank, nprocs, args):
+def main_worker(local_rank, nprocs, args, towards='side'):
     args.local_rank = local_rank
     torch.cuda.set_device(args.local_rank)
 
@@ -150,20 +154,20 @@ def main_worker(local_rank, nprocs, args):
 
     device = torch.device('cuda', args.local_rank)
     model = CLIP(args.device, args)
-    model_path = './shuffler_checkpoints/0.01/100view_classifier.pth'
+    model_path = './shuffler_checkpoints/iter0/0.01/50view_classifier.pth'
     model.load_state_dict(torch.load(model_path))
     model.cuda()
 
     if is_main_process():
-        print("Loading training data ...")
-    classify_dataset = PicDataset(train=False)
+        print("Loading data ...")
+    classify_dataset = PicDataset(train=False, toward=towards)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset=classify_dataset)
     loader = dataloader.DataLoader(dataset=classify_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
     if is_main_process():
         print("Loaded!")
 
     for view in ['front', 'back', 'side']:
-        os.makedirs(os.path.join("./dataset/laion5B_filter", view), exist_ok=True)
+        os.makedirs(os.path.join("./dataset/laion5B_filter_iter0", view), exist_ok=True)
 
     view2label = {'back': 0, 'front': 1, 'side': 2, 'others': 3}
     label2view = ['back', 'front', 'side', 'others']
@@ -174,14 +178,15 @@ def main_worker(local_rank, nprocs, args):
         image = image.cuda()
         pred = model(image)
         view_type = pred.argmax(dim=1)
-        threshold = 0.4
+        threshold = 0.8
         for i in range(image.shape[0]):
-            if view_type[i] < 2.5 and pred[i, view_type[i]] > threshold:
+            if int(view_type[i]) == view2label[towards] and pred[i, view_type[i]] > threshold:
                 try:
                     view = label2view[int(view_type[i])]
-                    path = os.path.join("./dataset/laion5B_filter", view, f'{pred[i, view_type[i]]:.2f}_{label[i]}.jpg')
+                    path = os.path.join("./dataset/laion5B_filter_iter0", view,
+                                        f'{pred[i, view_type[i]]:.2f}_{label[i]}.jpg')
                     torchvision.utils.save_image(image[i], path, normalize=True)
-                except (FileNotFoundError, OSError):
+                except (FileNotFoundError, OSError, ValueError):
                     continue
 
 

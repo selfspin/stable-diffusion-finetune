@@ -14,11 +14,6 @@ from torch import nn
 
 from torchvision.utils import save_image
 
-from PIL import ImageFile
-
-
-# ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 
 class DiffusionLoss(nn.Module):
     def __init__(self):
@@ -29,7 +24,7 @@ class DiffusionLoss(nn.Module):
 
 
 class PicDataset(dataset.Dataset):
-    def __init__(self, picture_size=512, toward='side', train=True):
+    def __init__(self, picture_size=512, toward='back', train=True):
         super().__init__()
         self.train = train
         self.toward = toward
@@ -64,14 +59,14 @@ class PicDataset(dataset.Dataset):
                 self.label_list.append(label_list[i])
 
     def __getitem__(self, index):
-        # try:
-        label = self.label_list[index]
-        img_path = 'dataset/images/' + self.toward + '/{id}.png'.format(id=self.ID_list[index])
-        img = Image.open(img_path)
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        # except (PIL.UnidentifiedImageError, UserWarning):
-        #     return self.__getitem__(index + 1)
+        try:
+            label = self.label_list[index]
+            img_path = 'dataset/images/' + self.toward + '/{id}.png'.format(id=self.ID_list[index])
+            img = Image.open(img_path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+        except (PIL.UnidentifiedImageError, UserWarning):
+            return self.__getitem__(index + 1)
 
         # 注意区分预处理
         if self.train:
@@ -203,10 +198,13 @@ class PandaDataset(dataset.Dataset):
 
 
 class ViewDataset(dataset.Dataset):
-    def __init__(self, picture_size=512, train=True):
+    def __init__(self, picture_size=512, train=True, iter=0):
         super().__init__()
         self.train = train
-        self.image_path = './dataset/handmade'
+        if train:
+            self.image_path = f'./dataset/handmade/iter{iter}/train'
+        else:
+            self.image_path = f'./dataset/handmade/iter{iter}/test'
         self.label_list = []
         self.ID_list = []
 

@@ -3,6 +3,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch
 import matplotlib.pyplot as plt
 
+
 class GradualWarmupScheduler(_LRScheduler):
     def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
         self.multiplier = multiplier
@@ -20,8 +21,8 @@ class GradualWarmupScheduler(_LRScheduler):
                 return self.after_scheduler.get_lr()
             return [base_lr * self.multiplier for base_lr in self.base_lrs]
 
-        return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
-
+        return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in
+                self.base_lrs]
 
     def step(self, epoch=None, metrics=None):
         if self.finished and self.after_scheduler:
@@ -31,6 +32,7 @@ class GradualWarmupScheduler(_LRScheduler):
                 self.after_scheduler.step(epoch - self.total_epoch)
         else:
             return super(GradualWarmupScheduler, self).step(epoch)
+
 
 if __name__ == '__main__':
     v = torch.zeros(10)
@@ -45,7 +47,5 @@ if __name__ == '__main__':
         b.append(optim.param_groups[0]['lr'])
         print(epoch, optim.param_groups[0]['lr'])
 
-    plt.plot(a,b)
+    plt.plot(a, b)
     plt.show()
-
-

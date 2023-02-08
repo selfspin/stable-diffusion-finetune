@@ -155,25 +155,34 @@ def main_worker(local_rank, nprocs, args):
     train_dataset = ViewDataset(train=True)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset=train_dataset)
     trainloader = dataloader.DataLoader(dataset=train_dataset, batch_size=args.bs, shuffle=False, sampler=sampler)
+
+    test_dataset = ViewDataset(train=False)
+    sampler_test = torch.utils.data.distributed.DistributedSampler(dataset=test_dataset)
+    testloader = dataloader.DataLoader(dataset=test_dataset, batch_size=args.bs, shuffle=False, sampler=sampler_test)
     if is_main_process():
         print("Loaded!")
 
-    for max_lr in [1e-2, 1e-3, 1e-4]:
-        os.makedirs(os.path.join("shuffler_checkpoints/", str(max_lr)), exist_ok=True)
+    for max_lr in [1e-2]:
+        os.makedirs(os.path.join("shuffler_checkpoints/", 'iter0', str(max_lr)), exist_ok=True)
         args.lr_max = max_lr
 
+        parameter_setting_list = []
         model = CLIP(args.device, args)
         for name, parameter in model.named_parameters():
             if 'clip_model' in name:
-                parameter.requires_grad = False
+                # parameter.requires_grad = False
+                parameter_setting_list.append({'params': parameter, 'lr': 0.0001 * args.lr_max / 10})
+            else:
+                parameter_setting_list.append({'params': parameter, 'lr': args.lr_max / 10})
 
         if args.world_size > 1:
             process_group = torch.distributed.new_group(list(range(dist.get_world_size())))
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
-                                                              find_unused_parameters=False)
+                                                              find_unused_parameters=True)
 
-        opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max / 10, weight_decay=0.001)
+        # opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_max / 10, weight_decay=0.001)
+        opt = optim.Adam(parameter_setting_list, lr=args.lr_max / 10, weight_decay=0.001)
         scaler = torch.cuda.amp.GradScaler()
         # lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
         #                                   [0, args.lr_max, args.lr_max / 20.0, 0])[0]
@@ -221,6 +230,17 @@ def main_worker(local_rank, nprocs, args):
                 train_acc += (label == pred.argmax(dim=1)).sum()
                 n += image.size(0)
 
+            model.eval()
+            test_acc, m = 0, 0
+            with torch.no_grad():
+                for image, label in testloader:
+                    image = image.cuda()
+                    label = label.cuda()
+                    with torch.cuda.amp.autocast():
+                        pred = model(image)
+                    test_acc += (label == pred.argmax(dim=1)).sum()
+                    m += image.size(0)
+
             scheduler.step()
             loss_list.append(train_loss / n)
             lr_list.append(lr)
@@ -229,9 +249,10 @@ def main_worker(local_rank, nprocs, args):
                 print(
                     f'[Epoch: {epoch} | Train Loss: {train_loss / n:.4f},'
                     f'Train Acc: {train_acc / n:.4f},'
+                    f'Test Acc: {test_acc / m:.4f},'
                     f'Time: {time.time() - start:.1f}, lr: {lr:.10f}')
-                if (epoch + 1) % 100 == 0:
-                    torch.save(model.module.state_dict(), os.path.join("shuffler_checkpoints", str(max_lr),
+                if (epoch + 1) % 50 == 0:
+                    torch.save(model.module.state_dict(), os.path.join("shuffler_checkpoints", 'iter0', str(max_lr),
                                                                        str(epoch + 1) + "view_classifier.pth"))
 
 
